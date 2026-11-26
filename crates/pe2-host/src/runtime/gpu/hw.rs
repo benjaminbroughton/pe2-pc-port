@@ -124,8 +124,24 @@ fn vram_at(x: u32, y: u32) -> u32 {
 // bilinear filtering (a copy: the game's grey negative of it), 29 texel
 // clamping (limits: the polygon's u, v minimum and maximum, a byte each),
 // 30 set the mask bit. Alpha is the mask bit written.
+//
+// The second target marks the pixels primitives drew (1) and those uploads
+// and copies wrote (0): the widescreen split clears it where the scene ends,
+// so it then holds what the UI drew (see Op::Split).
+struct Drawn {
+    @location(0) color: vec4<f32>,
+    @location(1) ui: f32,
+};
+
 @fragment
-fn fs(o: Out) -> @location(0) vec4<f32> {
+fn fs(o: Out) -> Drawn {
+    var d: Drawn;
+    d.color = shade(o);
+    d.ui = select(0.0, 1.0, ((o.mode >> 26u) & 3u) == 0u);
+    return d;
+}
+
+fn shade(o: Out) -> vec4<f32> {
     let kind = (o.mode >> 26u) & 3u;
     // A polygon's texel as the console takes it: the coordinate at the
     // console pixel's integer position, rounded to the nearest (plus half a
@@ -527,7 +543,14 @@ enum Op {
     /// Copies a picture to (x, y) of the scratch texture (for the Draw
     /// after it).
     PictureToScratch { hash: u64, x: u32, y: u32 },
+    /// Widescreen: where a frame's scene ends and its UI begins. Copies the
+    /// frame's rectangle of the target, as drawn so far, to the scene layer,
+    /// and clears the UI marks there, so what is drawn after it is marked.
+    Split { x: u32, y: u32, w: u32, h: u32 },
 }
+
+/// The format of the UI marks (the fragment shader's second target).
+const UI_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
 /// A native VRAM rectangle, inclusive.
 #[derive(Clone, Copy)]
@@ -759,6 +782,15 @@ pub struct Hw {
     /// the card.
     tracker: super::textures::Tracker,
     atlas: super::atlas::Atlas,
+    /// Widescreen (Op::Split): the UI marks, the scene layer (created at the
+    /// first split), zeros to clear marks with, the marks frames drawn
+    /// again write (not kept), and where frames were split (the layer's
+    /// pixels, a frame's top left corner).
+    pub ui: wgpu::Texture,
+    pub scene: Option<wgpu::Texture>,
+    zeros: Option<wgpu::Texture>,
+    ui_replay: Option<wgpu::Texture>,
+    pub splits: Vec<(u32, u32)>,
 }
 
 impl Hw {
@@ -787,6 +819,7 @@ impl Hw {
         );
         let scratch =
             texture("hw scratch", width, height, wgpu::TextureFormat::Rgba8Unorm, U::TEXTURE_BINDING | U::COPY_DST);
+        let ui = texture("hw ui", width, height, UI_FORMAT, U::RENDER_ATTACHMENT | U::COPY_SRC | U::COPY_DST);
         let vram = texture(
             "hw vram",
             VRAM_WIDTH as u32,
@@ -877,11 +910,18 @@ impl Hw {
                     fragment: Some(wgpu::FragmentState {
                         module: &module,
                         entry_point: Some("fs"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            blend: b.state(),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
+                        targets: &[
+                            Some(wgpu::ColorTargetState {
+                                format: wgpu::TextureFormat::Rgba8Unorm,
+                                blend: b.state(),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                            Some(wgpu::ColorTargetState {
+                                format: UI_FORMAT,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                        ],
                         compilation_options: Default::default(),
                     }),
                     primitive: wgpu::PrimitiveState::default(),
@@ -927,6 +967,11 @@ impl Hw {
             down,
             tracker: Default::default(),
             atlas,
+            ui,
+            scene: None,
+            zeros: None,
+            ui_replay: None,
+            splits: Vec::new(),
         }
     }
 
@@ -1957,11 +2002,31 @@ impl Hw {
             gfx.queue.write_buffer(&self.upload_buffer, 0, ubytes);
         }
 
+        // Frames drawn again mark a texture of their own: the marks are the
+        // frame's as the game drew it.
+        if replay && self.ui_replay.is_none() {
+            self.ui_replay =
+                Some(self.layer_texture_as("hw ui replay", UI_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT));
+        }
+        if !replay && self.scene.is_none() && ops.iter().any(|op| matches!(op, Op::Split { .. })) {
+            self.scene =
+                Some(self.layer_texture("hw scene", wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST));
+        }
         let vertex_buffer = self.vertex_buffer.as_ref().unwrap();
         let view = into.create_view(&Default::default());
+        let ui_view = if replay { self.ui_replay.as_ref().unwrap() } else { &self.ui }.create_view(&Default::default());
         let mut encoder = device.create_command_encoder(&Default::default());
         let mut i = 0;
         while i < ops.len() {
+            if let Op::Split { x, y, w, h } = ops[i] {
+                if !replay && let (Some(scene), Some(zeros)) = (self.scene.as_ref(), self.zeros.as_ref()) {
+                    let extent = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+                    encoder.copy_texture_to_texture(origin_at(into, x, y), origin_at(scene, x, y), extent);
+                    encoder.copy_texture_to_texture(zeros.as_image_copy(), origin_at(&self.ui, x, y), extent);
+                }
+                i += 1;
+                continue;
+            }
             if let Op::ToScratch { x, y, w, h } = ops[i] {
                 let on_screen = match (&self.before, replay) {
                     (Some((_, (rx, ry, rw, rh))), true) => x >= *rx && y >= *ry && x + w <= rx + rw && y + h <= ry + rh,
@@ -1995,14 +2060,17 @@ impl Hw {
                 continue;
             }
             // A render pass over the run of draws up to the next copy.
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("hw"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+            let attach = |view| {
+                Some(wgpu::RenderPassColorAttachment {
+                    view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
+                })
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("hw"),
+                color_attachments: &[attach(&view), attach(&ui_view)],
                 ..Default::default()
             });
             pass.set_vertex_buffer(0, vertex_buffer.slice(..));
@@ -2051,16 +2119,52 @@ impl Hw {
 
     /// A texture the size of the layer.
     fn layer_texture(&self, label: &str, usage: wgpu::TextureUsages) -> wgpu::Texture {
+        self.layer_texture_as(label, wgpu::TextureFormat::Rgba8Unorm, usage)
+    }
+
+    fn layer_texture_as(&self, label: &str, format: wgpu::TextureFormat, usage: wgpu::TextureUsages) -> wgpu::Texture {
         self.gfx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: self.target.size(),
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format,
             usage,
             view_formats: &[],
         })
+    }
+
+    // ---- widescreen -------------------------------------------------------
+
+    /// Widescreen: the frame at native (x, y), `w` x `h`, has drawn its
+    /// scene; what follows is its UI (Op::Split).
+    pub fn split(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        let s = self.scale;
+        let (x, y) = ((x.max(0) * s) as u32, (y.max(0) * s) as u32);
+        let w = ((w * s) as u32).min(self.width.saturating_sub(x));
+        let h = ((h * s) as u32).min(self.height.saturating_sub(y));
+        if w == 0 || h == 0 {
+            return;
+        }
+        // wgpu clears new textures: these stay zero.
+        if self.zeros.as_ref().is_none_or(|z| z.width() < w || z.height() < h) {
+            self.zeros = Some(self.gfx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("hw ui zeros"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: UI_FORMAT,
+                usage: wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            }));
+        }
+        self.ops.push(Op::Split { x, y, w, h });
+        if !self.splits.contains(&(x, y)) {
+            self.splits.insert(0, (x, y));
+            self.splits.truncate(4);
+        }
     }
 
     /// Copies a region of one layer-sized texture to the same place in

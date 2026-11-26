@@ -9,6 +9,8 @@
 //! (or of the scratchpad) every five seconds (a game's state while it seems stuck).
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{EXCEPTION_SINGLE_STEP, HANDLE, NTSTATUS};
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -18,6 +20,69 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 use windows_sys::Win32::System::Threading::{ResumeThread, SuspendThread};
 
 static WATCHED: OnceLock<Vec<u32>> = OnceLock::new();
+
+/// Widescreen: what the game says of its frames (`pcMenuFrame` in the fork's
+/// menu.c reports it every frame: 1 live field gameplay, 2 the field held for
+/// a moment, 3 PE2PC's menu open, 0 other frames: a camera cut's, a load's),
+/// when it last said anything, and when it last said 1 (ms since first use,
+/// plus 1, so 0 means never).
+static FIELD: AtomicU32 = AtomicU32::new(0);
+static FIELD_AT: AtomicU64 = AtomicU64::new(0);
+static LIVE_AT: AtomicU64 = AtomicU64::new(0);
+
+/// How long after live field gameplay other frames still count as the
+/// field: the field held (state 2, a room's transition), and other frames
+/// (state 0: a camera cut's, 124-238 ms measured; the end of the attract
+/// demo, about 520 ms, is not).
+const FIELD_HOLD_MS: u64 = 600;
+const OTHER_HOLD_MS: u64 = 260;
+
+fn field_clock() -> u64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// Called by the game each frame it runs `pcMenuFrame`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_widescreen_field(field: i32) {
+    // Not interrupted while printing.
+    let _g = super::irq::guard();
+    let state = field.clamp(0, 3) as u32;
+    if FIELD.swap(state, Ordering::Relaxed) != state {
+        let name = ["off", "ON", "held", "menu"][state as usize];
+        eprintln!("[wide {:8.3}] field gameplay -> {name}", super::spu::stamp());
+    }
+    let now = field_clock();
+    FIELD_AT.store(now, Ordering::Relaxed);
+    if state == 1 {
+        LIVE_AT.store(now, Ordering::Relaxed);
+    }
+}
+
+/// Live field gameplay, as of the last 150 ms.
+fn field_live() -> bool {
+    let at = FIELD_AT.load(Ordering::Relaxed);
+    FIELD.load(Ordering::Relaxed) == 1 && at != 0 && field_clock().saturating_sub(at) < 150
+}
+
+/// Field gameplay, and no movie streaming or menu open: live (as of the
+/// last 150 ms), or live no longer than FIELD_HOLD_MS ago.
+fn in_field() -> bool {
+    if super::stream::active() {
+        return false;
+    }
+    let now = field_clock();
+    let at = FIELD_AT.load(Ordering::Relaxed);
+    match FIELD.load(Ordering::Relaxed) {
+        1 if at != 0 && now.saturating_sub(at) < 150 => true,
+        3 => false,
+        state => {
+            let live = LIVE_AT.load(Ordering::Relaxed);
+            let hold = if state == 2 { FIELD_HOLD_MS } else { OTHER_HOLD_MS };
+            live != 0 && now.saturating_sub(live) < hold
+        }
+    }
+}
 
 fn watched() -> &'static [u32] {
     WATCHED.get_or_init(|| {
@@ -66,8 +131,176 @@ pub fn arm(thread: HANDLE) {
     }
 }
 
+/// Widescreen pan probe. `PE2_AYA_PROBE=1` logs, twice a second, the
+/// translation of the matrix `gPlayerStatus.coordMtx` points at, the one
+/// 0x20 bytes after it (the root node's `workm`, if `coordMtx` points at its
+/// `coord`), the projection distance, and where `workm` would project.
+fn start_aya_probe() {
+    if !std::env::var("PE2_AYA_PROBE").is_ok_and(|v| v.trim() == "1") {
+        return;
+    }
+    std::thread::spawn(|| {
+        eprintln!("[aya] probe started");
+        const COORD_MTX: u32 = 0x8007_3B8C; // gPlayerStatus + 4
+        const SCREEN_DISTANCE: u32 = 0x8007_1078; // gDisplayState + 0x110
+        // SAFETY: fixed addresses inside PSX RAM, mapped for the process's
+        // life; a racy read is fine for a look.
+        let rd32 = |a: u32| unsafe { (a as usize as *const i32).read_unaligned() };
+        let rd16 = |a: u32| unsafe { (a as usize as *const u16).read_unaligned() };
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let ptr = rd32(COORD_MTX) as u32;
+            let h = rd16(SCREEN_DISTANCE);
+            if !(0x8000_0000..0x8020_0000 - 0x40).contains(&ptr) {
+                eprintln!("[aya {:8.3}] coordMtx=0x{ptr:08X} (not in RAM) H={h}", super::spu::stamp());
+                continue;
+            }
+            let t = |base: u32| [rd32(base + 0x14), rd32(base + 0x18), rd32(base + 0x1C)];
+            let local = t(ptr);
+            let work = t(ptr + 0x20);
+            let proj = if work[2] > 0 {
+                let z = work[2] as i64;
+                format!("({}, {})", work[0] as i64 * h as i64 / z, work[1] as i64 * h as i64 / z)
+            } else {
+                "behind".to_string()
+            };
+            eprintln!(
+                "[aya {:8.3}] coordMtx=0x{ptr:08X} local t=({}, {}, {}) work t=({}, {}, {}) H={h} proj={proj}",
+                super::spu::stamp(),
+                local[0],
+                local[1],
+                local[2],
+                work[0],
+                work[1],
+                work[2]
+            );
+        }
+    });
+}
+
+/// Widescreen pan: where Aya's root is on the screen, as a fraction of the
+/// picture's height. Err: not the field, or the field live with no player in
+/// it (the title screen); Ok(None): the field without a reading now (held
+/// where it was, as across a camera cut). Read on the game's thread when a
+/// frame is complete (gpu's ClearOTagR and DrawOTag), so the frame shown
+/// carries its own (`frame_row`).
+pub type Row = Result<Option<f32>, ()>;
+
+pub fn aya_row() -> Row {
+    const COORD_MTX: u32 = 0x8007_3B8C; // gPlayerStatus + 4
+    const SCREEN_DISTANCE: u32 = 0x8007_1078; // gDisplayState + 0x110
+    if !in_field() {
+        return Err(());
+    }
+    // SAFETY: fixed addresses inside PSX RAM, mapped for the process's life.
+    let rd32 = |a: u32| unsafe { (a as usize as *const i32).read_unaligned() };
+    let rd16 = |a: u32| unsafe { (a as usize as *const u16).read_unaligned() };
+    let none = || if field_live() { Err(()) } else { Ok(None) };
+    let ptr = rd32(COORD_MTX) as u32;
+    let h = rd16(SCREEN_DISTANCE) as i64;
+    if !(0x8000_0000..0x8020_0000 - 0x40).contains(&ptr) || h == 0 {
+        return none();
+    }
+    // The root's `workm` is 0x20 bytes after its `coord`; its translation
+    // (view space) is at +0x14: x, y, z.
+    let y = rd32(ptr + 0x20 + 0x18) as i64;
+    let z = rd32(ptr + 0x20 + 0x1C) as i64;
+    if z <= 0 {
+        return none();
+    }
+    let row = 120.0 + (y * h / z) as f32;
+    Ok(Some((row / 240.0).clamp(-1.0, 2.0)))
+}
+
+/// The pan tracker's state (see `frame_row`).
+struct Track {
+    /// The last reading, and when it was taken.
+    good: Option<f32>,
+    at: Option<Instant>,
+    /// The shown frame's background, frames shown since it changed, and
+    /// jumps ignored in a row.
+    background: Option<u64>,
+    since_cut: u32,
+    ignored: u32,
+}
+static TRACK: std::sync::Mutex<Track> =
+    std::sync::Mutex::new(Track { good: None, at: None, background: None, since_cut: u32::MAX, ignored: 0 });
+
+/// PE2_TRACE=panshots: whether the frame being shown is near a camera cut
+/// (held out of live play, or within ten frames after a cut).
+pub fn near_cut() -> bool {
+    (FIELD.load(Ordering::Relaxed) != 1 && in_field()) || TRACK.lock().unwrap().since_cut < 10
+}
+
+/// A new frame is shown, with Aya's place now (see `aya_row`) and the
+/// fingerprint of its background: publishes Aya's place to `present` (NaN
+/// when there is no player). A camera cut is the background changing: a jump
+/// of Aya's place (more than 15% of the height) is taken on that frame or
+/// the few after it, when the game's state catches up, and the strip goes
+/// there at once. A jump with the same background is the game's state
+/// ahead of the picture (it shows the old view for a moment at a cut):
+/// ignored, unless it lasts. A place far off the picture is no reading.
+pub fn frame_row(row: Row, background: Option<u64>) {
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    const JUMP: f32 = 0.15;
+    const CATCH_UP_FRAMES: u32 = 4;
+    const LASTING_FRAMES: u32 = 8;
+    let publish = |v: f32| crate::present::AYA_FY.store(v.to_bits(), Relaxed);
+    let pan = super::trace("pan");
+    let mut t = TRACK.lock().unwrap();
+    t.since_cut = t.since_cut.saturating_add(1);
+    if background.is_some() && background != t.background {
+        if t.background.is_some() && pan {
+            eprintln!("[pan {:8.3}] new background shown", super::spu::stamp());
+        }
+        (t.background, t.since_cut) = (background, 0);
+    }
+    if pan {
+        let state = ["off", "ON", "held", "menu"][FIELD.load(Relaxed).min(3) as usize];
+        let row = match row {
+            Err(()) => "none".to_string(),
+            Ok(None) => "unread".to_string(),
+            Ok(Some(v)) => format!("{v:.3}"),
+        };
+        eprintln!("[pan {:8.3}] frame: field {state}, Aya at {row}", super::spu::stamp());
+    }
+    let row = row.map(|r| r.filter(|v| (-0.25..=1.25).contains(v)));
+    match row {
+        Err(()) => {
+            (t.good, t.at, t.ignored) = (None, None, 0);
+            publish(f32::NAN);
+        }
+        Ok(None) => {
+            if t.at.is_none_or(|at| at.elapsed().as_millis() as u64 >= FIELD_HOLD_MS) {
+                (t.good, t.at, t.ignored) = (None, None, 0);
+                publish(f32::NAN);
+            }
+        }
+        Ok(Some(v)) => {
+            let jump = t.good.is_some_and(|g| (v - g).abs() > JUMP);
+            if jump && t.since_cut >= CATCH_UP_FRAMES && t.ignored < LASTING_FRAMES {
+                t.ignored += 1;
+                if pan {
+                    eprintln!("[pan {:8.3}] jump with the same background: ignored", super::spu::stamp());
+                }
+                return;
+            }
+            let cut = jump || t.good.is_none();
+            (t.good, t.at, t.ignored) = (Some(v), Some(Instant::now()), 0);
+            publish(v);
+            if cut {
+                crate::present::AYA_CUTS.fetch_add(1, Release);
+                if pan {
+                    eprintln!("[pan {:8.3}] cut", super::spu::stamp());
+                }
+            }
+        }
+    }
+}
+
 /// Starts PE2_PEEK, if set.
 pub fn start_peek() {
+    start_aya_probe();
     let Ok(spec) = std::env::var("PE2_PEEK") else { return };
     let regions: Vec<(u32, u32)> = spec
         .split(',')
