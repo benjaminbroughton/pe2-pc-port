@@ -493,6 +493,12 @@ fn viewport(ww: u32, wh: u32, tw: u32, th: u32, integer: bool) -> (u32, u32, u32
 /// are written by the tracker thread in `runtime/watch.rs`.
 pub static AYA_FY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(f32::NAN.to_bits());
 pub static AYA_CUTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// How far up and down her body reaches with that row (the top of her head
+/// and her feet, fractions of the picture's height; NaN when unknown).
+/// Where the strip starts now (a fraction of the picture's height), for traces.
+pub static STRIP_TOP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub static AYA_TOP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(f32::NAN.to_bits());
+pub static AYA_BOTTOM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(f32::NAN.to_bits());
 
 /// The strip follows Aya instead of staying put: on unless
 /// PE2_WIDESCREEN_TRACK=0 (then PE2_WIDESCREEN_PAN places it).
@@ -510,18 +516,26 @@ struct Pan {
 static PAN_STATE: std::sync::Mutex<Pan> = std::sync::Mutex::new(Pan { target: 0.0, top: 0.0, cuts: 0, last: None });
 
 /// Where the visible strip starts (a fraction of the picture's height): it
-/// stays still while Aya is inside it, moves when she gets within a margin
-/// of its top or bottom, glides to its target, and jumps at a camera cut
-/// (back to the middle, then whatever keeps her in view).
+/// stays still while all of Aya is inside it, moves when her head or feet
+/// get within a margin of its top or bottom, glides to its target, and
+/// jumps at a camera cut (back to the middle, then whatever keeps her in
+/// view). Taller than the strip (a close camera), her head is kept in it.
+/// Without her extent, her root with fixed margins.
 fn tracked_top(visible: f32) -> f32 {
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
-    const MARGIN_ABOVE: f32 = 0.25; // head room over her feet
+    const MARGIN_ABOVE: f32 = 0.25; // head room over her root, without her extent
     const MARGIN_BELOW: f32 = 0.10;
+    // Between her extent and the strip's edges. More over her head: her
+    // model is drawn up to about 7 lines (0.03) above where her joints
+    // project (measured close up), and her head matters most.
+    const EDGE_ABOVE: f32 = 0.06;
+    const EDGE_BELOW: f32 = 0.03;
     const SETTLE: f32 = 0.12; // seconds to cover most of a move
     let max_top = 1.0 - visible;
     let centre = max_top * 0.5;
     let cuts = AYA_CUTS.load(Acquire);
     let fy = f32::from_bits(AYA_FY.load(Relaxed));
+    let (head, feet) = (f32::from_bits(AYA_TOP.load(Relaxed)), f32::from_bits(AYA_BOTTOM.load(Relaxed)));
     let mut s = PAN_STATE.lock().unwrap();
     let now = std::time::Instant::now();
     let dt = s.last.map_or(0.0, |t| now.duration_since(t).as_secs_f32()).min(0.1);
@@ -540,11 +554,17 @@ fn tracked_top(visible: f32) -> f32 {
         if cut {
             s.target = centre;
         }
-        if fy - MARGIN_ABOVE < s.target {
-            s.target = fy - MARGIN_ABOVE;
-        }
-        if fy + MARGIN_BELOW > s.target + visible {
-            s.target = fy + MARGIN_BELOW - visible;
+        let (above, below) = if head <= feet { (head - EDGE_ABOVE, feet + EDGE_BELOW) } else { (fy - MARGIN_ABOVE, fy + MARGIN_BELOW) };
+        if below - above > visible {
+            // More of her than fits: her head, as far down as the strip goes.
+            s.target = above;
+        } else {
+            if above < s.target {
+                s.target = above;
+            }
+            if below > s.target + visible {
+                s.target = below - visible;
+            }
         }
         s.target = s.target.clamp(0.0, max_top);
     }
@@ -557,6 +577,7 @@ fn tracked_top(visible: f32) -> f32 {
         s.top += (s.target - s.top) * (1.0 - (-dt / SETTLE).exp());
     }
     s.top = s.top.clamp(0.0, max_top);
+    STRIP_TOP.store(s.top.to_bits(), Relaxed);
     s.top
 }
 /// Widescreen. When on, a 4:3 picture in a window wider

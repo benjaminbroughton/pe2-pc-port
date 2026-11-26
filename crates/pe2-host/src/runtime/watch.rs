@@ -246,7 +246,93 @@ pub fn aya_row() -> Row {
         return none();
     }
     let row = 120.0 + (y * h / z) as f32;
+    let extent = aya_extent(ptr, h);
+    PENDING_EXTENT.0.store(extent.map_or(f32::NAN, |e| e.0).to_bits(), Ordering::Relaxed);
+    PENDING_EXTENT.1.store(extent.map_or(f32::NAN, |e| e.1).to_bits(), Ordering::Relaxed);
     Ok(Some((row / 240.0).clamp(-1.0, 2.0)))
+}
+
+/// Aya's extent read with the last `aya_row` (top and bottom, fractions of
+/// the picture's height; NaN: none), published with its row by `frame_row`.
+static PENDING_EXTENT: (AtomicU32, AtomicU32) = (AtomicU32::new(0x7FC0_0000), AtomicU32::new(0x7FC0_0000));
+
+/// Where Aya's body reaches on the screen, from the top of her head to her
+/// feet, as fractions of the picture's height. Her model's parts
+/// (`GfxCoord`, 0x50 bytes each) follow its `TmdObject` (0x34 bytes: its
+/// `coords` at +8, `partCount` at +0x30), the root first, whose `coord`
+/// `coordMtx` points at (+4); each part's `workm` (+0x24) holds where it is
+/// in view space, its translation at +0x14. The parts are joints: the top
+/// of her head is above the highest (her head's), her soles a little below
+/// the lowest. None when the layout does not check out.
+fn aya_extent(coord_mtx: u32, h: i64) -> Option<(f32, f32)> {
+    const PART_BYTES: u32 = 0x50;
+    const OBJECT_BYTES: u32 = 0x34;
+    // Beyond the joints, as fractions of the span between them: the top of
+    // the head over the head's joint, the soles under the ankles'.
+    const ABOVE: f32 = 0.14;
+    const BELOW: f32 = 0.06;
+    // SAFETY: addresses checked to lie inside PSX RAM, mapped for the
+    // process's life; a racy read is fine for a reading.
+    let rd32 = |a: u32| unsafe { (a as usize as *const i32).read_unaligned() };
+    let in_ram = |a: u32, len: u32| (0x8000_0000..0x8020_0000u32.saturating_sub(len)).contains(&a);
+    let parts = coord_mtx.wrapping_sub(4);
+    let object = parts.wrapping_sub(OBJECT_BYTES);
+    if !in_ram(object, OBJECT_BYTES) || rd32(object + 8) as u32 != parts {
+        return None;
+    }
+    let count = rd32(object + 0x30);
+    if !(1..=64).contains(&count) || !in_ram(parts, count as u32 * PART_BYTES) {
+        return None;
+    }
+    let (mut top, mut bottom) = (f32::INFINITY, f32::NEG_INFINITY);
+    // PE2_TRACE=ayaparts: every part's place, once a second.
+    static LOGGED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    let log = super::trace("ayaparts") && {
+        let mut at = LOGGED.lock().unwrap();
+        let due = at.is_none_or(|t| t.elapsed().as_secs_f32() >= 1.0);
+        if due {
+            *at = Some(Instant::now());
+        }
+        due
+    };
+    let mut line = String::new();
+    for i in 0..count as u32 {
+        let node = parts + i * PART_BYTES;
+        let t = node + 0x24 + 0x14;
+        let (y, z) = (rd32(t + 4) as i64, rd32(t + 8) as i64);
+        if log {
+            let parent = rd32(node + 0x4C) as u32;
+            let p = if parent >= parts && parent < parts + count as u32 * PART_BYTES {
+                format!("{}", (parent - parts) / PART_BYTES)
+            } else {
+                format!("{parent:08X}")
+            };
+            line += &format!(
+                " #{i}<{p} stamp {:08X} y {y} z {z} row {:.3};",
+                rd32(node) as u32,
+                if z > 0 { (120.0 + (y * h / z) as f32) / 240.0 } else { f32::NAN }
+            );
+        }
+        if z <= 0 {
+            continue;
+        }
+        let row = (120.0 + (y * h / z) as f32) / 240.0;
+        top = top.min(row);
+        bottom = bottom.max(row);
+    }
+    if log {
+        eprintln!(
+            "[ayaparts {:8.3}] H {h}, strip at {:.3}, {count} parts:{line}",
+            super::spu::stamp(),
+            f32::from_bits(crate::present::STRIP_TOP.load(Ordering::Relaxed))
+        );
+    }
+    // No part in front of the camera: no extent.
+    if !top.is_finite() {
+        return None;
+    }
+    let span = bottom - top;
+    Some((top - span * ABOVE, bottom + span * BELOW))
 }
 
 /// The pan tracker's state (see `frame_row`).
@@ -297,7 +383,11 @@ pub fn frame_row(row: Row, background: Option<u64>) {
         let row = match row {
             Err(()) => "none".to_string(),
             Ok(None) => "unread".to_string(),
-            Ok(Some(v)) => format!("{v:.3}"),
+            Ok(Some(v)) => format!(
+                "{v:.3} (head {:.3}, feet {:.3})",
+                f32::from_bits(PENDING_EXTENT.0.load(Relaxed)),
+                f32::from_bits(PENDING_EXTENT.1.load(Relaxed))
+            ),
         };
         // gDisplayState's displayOwner (+0x1E), pendingMode (+0x10D),
         // height (+0x1A) and gameMode (+0x11E).
@@ -346,6 +436,9 @@ pub fn frame_row(row: Row, background: Option<u64>) {
             }
             let cut = jump || t.good.is_none();
             (t.good, t.at, t.ignored) = (Some(v), Some(Instant::now()), 0);
+            // Her extent, read with this row, published before it.
+            crate::present::AYA_TOP.store(PENDING_EXTENT.0.load(Relaxed), Relaxed);
+            crate::present::AYA_BOTTOM.store(PENDING_EXTENT.1.load(Relaxed), Relaxed);
             publish(v);
             if cut {
                 crate::present::AYA_CUTS.fetch_add(1, Release);
