@@ -26,6 +26,7 @@ pub mod vram;
 pub use textures::host as host_texture;
 
 use std::sync::Mutex;
+use std::sync::atomic::Ordering::Relaxed;
 
 use vram::{DrawState, Shading, VRAM_HEIGHT, VRAM_WIDTH, Vertex, Vram};
 
@@ -84,6 +85,10 @@ pub struct Gpu {
     /// still moving. With frame interpolation (see note_backdrop).
     backdrop: (Option<u64>, Option<u64>),
     backdrop_moving: u32,
+    /// Widescreen pan: the backgrounds the game copied in (images of half
+    /// the screen or more), by where they went, as a fingerprint: the
+    /// shown frame's tells a camera cut (watch::frame_row).
+    backgrounds: Vec<((i32, i32), u64)>,
 }
 
 /// A screen image a mod's picture replaced: where it went, its hash and
@@ -256,6 +261,7 @@ pub fn start() {
         negatives: Vec::new(),
         backdrop: (None, None),
         backdrop_moving: 0,
+        backgrounds: Vec::new(),
     });
 }
 
@@ -839,6 +845,9 @@ pub extern "C" fn pcrt_IsIdleGPU(_max: i32) -> i32 {
 /// order DrawOTag(&ot[n-1]) walks.
 #[unsafe(no_mangle)]
 pub extern "C" fn pcrt_ClearOTagR(ot: *mut u32, n: i32) -> *mut u32 {
+    if n as u32 == OT_TAGS {
+        note_frame_ot(ot as u32);
+    }
     // SAFETY: the game passes an ordering table of `n` words.
     unsafe {
         for i in (1..n.max(1) as usize).rev() {
@@ -910,6 +919,116 @@ fn dump_due() -> bool {
     }
 }
 
+/// Tags of the game's frame ordering tables (`gGpuFrameOtTags[2][0x440]`):
+/// DrawOTag gets the last one, and depth 0 is 0x20 tags after the first
+/// (`_gpuBeginOt`), so the 32 before it are in front of every depth.
+const OT_TAGS: u32 = 0x440;
+const OT_RESERVED: i32 = 0x20;
+
+/// The game's frame ordering tables (as their first tags' addresses), as
+/// cleared with ClearOTagR: the two of them, most recent first.
+static FRAME_OTS: Mutex<[u32; 2]> = Mutex::new([0; 2]);
+
+fn note_frame_ot(ot: u32) {
+    let mut f = FRAME_OTS.lock().unwrap();
+    if f[0] != ot {
+        *f = [ot, f[0]];
+    }
+}
+
+/// A quick fingerprint of an image: every 61st pixel (enough to tell one
+/// background from another).
+fn fingerprint(pixels: &[u16]) -> u64 {
+    pixels.iter().step_by(61).fold(0xCBF2_9CE4_8422_2325u64, |h, &p| (h ^ u64::from(p)).wrapping_mul(0x100_0000_01B3))
+}
+
+/// Whether the GP0 command in `words` covers a whole `w` x `h` picture (a
+/// fade or a flash drawn over everything).
+fn covers_screen(words: &[u32], w: i32, h: i32) -> bool {
+    let Some(&w0) = words.first() else { return false };
+    let op = w0 >> 24;
+    let size = |i: usize| words.get(i).map(|s| ((s & 0x3FF) as i32, ((s >> 16) & 0x1FF) as i32));
+    let big = |(sw, sh): (i32, i32)| sw >= w && sh >= h;
+    match op {
+        0x02 => size(2).is_some_and(big),
+        0x60..=0x63 => size(2).is_some_and(big),
+        0x64..=0x67 => size(3).is_some_and(big),
+        0x20..=0x3F => {
+            let (gouraud, quad, textured) = (op & 0x10 != 0, op & 0x08 != 0, op & 0x04 != 0);
+            let mut i = 1;
+            let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+            for k in 0..if quad { 4 } else { 3 } {
+                if gouraud && k > 0 {
+                    i += 1;
+                }
+                let Some(&v) = words.get(i) else { return false };
+                let (x, y) = xy(v);
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                i += 1 + usize::from(textured);
+            }
+            x1 - x0 >= w - 1 && y1 - y0 >= h - 1
+        }
+        _ => false,
+    }
+}
+
+/// Whether DrawOTag(`start`) walks one of the game's frame ordering tables.
+fn is_frame_ot(start: *const u32) -> bool {
+    let base = (start as u32).wrapping_sub((OT_TAGS - 1) * 4);
+    base != 0 && FRAME_OTS.lock().unwrap().contains(&base)
+}
+
+/// Widescreen: the depth where the scene ends, relative to the game's depth
+/// base. Measured (PE2_TRACE=otdepth): the HUD draws at -2 and -1, dialogue
+/// at 2, 3 and 9, text at 4; the rooms' masks and 3D from 34 on.
+const UI_DEPTH: i32 = 16;
+
+/// The depth (relative to the game's depth base) of `node` when it is one of
+/// the tags of the table DrawOTag(`start`) walks, if `start` is a frame table.
+fn ot_bucket(start: *const u32, node: *const u32) -> Option<i32> {
+    let (start, node) = (start as u32, node as u32);
+    let base = start.wrapping_sub((OT_TAGS - 1) * 4);
+    (node >= base && node <= start && (node - base) % 4 == 0).then(|| ((node - base) / 4) as i32 - OT_RESERVED)
+}
+
+/// PE2_TRACE=otdepth: every few seconds, the packets drawn at each depth of
+/// the frame ordering table (the front 96 one by one, the rest together),
+/// with how many drew polygons and how many of those came from the GTE
+/// (exact vertices, so 3D). For finding the depth where the UI starts.
+fn otdepth_note(bucket: Option<i32>, poly: bool, exact: bool) {
+    use std::collections::BTreeMap;
+    type Counts = BTreeMap<i32, (u64, u64, u64)>;
+    static COUNTS: Mutex<Option<(Counts, std::time::Instant)>> = Mutex::new(None);
+    const FRONT: i32 = 96;
+    let key = match bucket {
+        Some(b) if b < FRONT => b,
+        Some(_) => FRONT,
+        None => i32::MAX, // not a frame table (task lists, menus)
+    };
+    let mut guard = COUNTS.lock().unwrap();
+    let (map, since) = guard.get_or_insert_with(|| (BTreeMap::new(), std::time::Instant::now()));
+    let e = map.entry(key).or_default();
+    e.0 += 1;
+    e.1 += u64::from(poly);
+    e.2 += u64::from(exact);
+    if since.elapsed().as_secs() >= 3 {
+        let line: Vec<String> = map
+            .iter()
+            .map(|(k, (n, p, x))| {
+                let name = match *k {
+                    i32::MAX => "other".to_string(),
+                    FRONT => format!("{FRONT}+"),
+                    k => k.to_string(),
+                };
+                format!("{name}:{n}/{p}/{x}")
+            })
+            .collect();
+        eprintln!("[otdepth] depth:packets/polygons/3D  {}", line.join(" "));
+        map.clear();
+        *since = std::time::Instant::now();
+    }
+}
+
 /// DrawOTag(p): draws every packet of the list starting at `p`.
 #[unsafe(no_mangle)]
 pub extern "C" fn pcrt_DrawOTag(p: *const u32) {
@@ -930,7 +1049,19 @@ pub extern "C" fn pcrt_DrawOTag(p: *const u32) {
         let mut node = p;
         let mut packets = 0;
         let mut words = Vec::with_capacity(16);
+        let depths = trace("otdepth");
+        // Widescreen: the frame's scene is drawn up to the first packet in
+        // front of UI_DEPTH (Hw::split), when the frame drew any. A frame
+        // drawing only UI (the game freezes the picture under a dialogue
+        // box) keeps the scene of the last.
+        let split = crate::present::widescreen_on() && is_frame_ot(p);
+        let (mut scene, mut split_done) = (false, false);
+        let frame_area = (g.state.area_x1, g.state.area_y1, g.display.width, g.display.height);
+        let mut bucket: Option<i32> = None;
         loop {
+            if depths || split {
+                bucket = ot_bucket(p, node).or(bucket);
+            }
             // SAFETY: ordering-table packets live in PSX RAM.
             let tag = unsafe { node.read() };
             let len = (tag >> 24) as usize;
@@ -939,13 +1070,41 @@ pub extern "C" fn pcrt_DrawOTag(p: *const u32) {
                 // SAFETY: the packet holds `len` words after its tag.
                 words.extend((1..=len).map(|i| unsafe { node.add(i).read() }));
                 g.cur_packet = node as u32;
+                if split && !split_done {
+                    if bucket.is_some_and(|b| b >= UI_DEPTH) {
+                        scene = true;
+                    } else if scene {
+                        g.hw.split(frame_area.0, frame_area.1, frame_area.2, frame_area.3);
+                        split_done = true;
+                    }
+                }
+                let before = (POLY_VERTICES.load(Relaxed), EXACT_VERTICES.load(Relaxed));
                 g.run(&words, node as u32 + 4);
+                // A fade over the whole picture, in front: part of the scene
+                // (all of the window fades), so the scene is taken again.
+                if split
+                    && scene
+                    && bucket.is_some_and(|b| b < UI_DEPTH)
+                    && covers_screen(&words, frame_area.2, frame_area.3)
+                {
+                    g.hw.split(frame_area.0, frame_area.1, frame_area.2, frame_area.3);
+                    split_done = true;
+                }
+                if depths {
+                    let polys = POLY_VERTICES.load(Relaxed) - before.0;
+                    let exact = EXACT_VERTICES.load(Relaxed) - before.1;
+                    otdepth_note(bucket, polys > 0, exact > 0);
+                }
             }
             packets += 1;
             if tag & 0x00FF_FFFF == 0x00FF_FFFF || packets > 1_000_000 {
                 break;
             }
             node = link_ptr(tag);
+        }
+        // A scene and no UI: all of it is scene (no marks left from before).
+        if scene && !split_done {
+            g.hw.split(frame_area.0, frame_area.1, frame_area.2, frame_area.3);
         }
         g.frame += 1;
         if g.dump_out.take().is_some() {
@@ -1021,6 +1180,12 @@ pub extern "C" fn pcrt_LoadImage(rect: *const Rect, p: *const u16) -> i32 {
         g.vram.write_rect(x0, y0, w, h, pixels);
         g.post(x0, y0, w, h);
         g.note_backdrop(w, h, || pixels.to_vec());
+        if w * h >= BACKDROP_PIXELS && crate::present::tracking() {
+            let print = fingerprint(pixels);
+            g.backgrounds.retain(|b| b.0 != (x0, y0));
+            g.backgrounds.insert(0, ((x0, y0), print));
+            g.backgrounds.truncate(4);
+        }
         // A screen image (a background, a full-screen picture: about the
         // size of the screen, where the game draws or shows) is known to
         // mods by its hash.
@@ -1352,6 +1517,11 @@ struct Front {
 /// copied out of the layer's texture, and its size.
 pub struct CardFront {
     pub texture: wgpu::Texture,
+    /// Widescreen: the picture's scene (as drawn before its UI) and its UI
+    /// marks (1 where the UI drew), when `layered`.
+    pub scene: wgpu::Texture,
+    pub ui: wgpu::Texture,
+    pub layered: bool,
     pub width: u32,
     pub height: u32,
 }
@@ -1444,10 +1614,14 @@ pub fn latch() {
     if g.generation == g.latched {
         // No new frame: the frame in between, if one is ready.
         let pending = g.interp.as_mut().and_then(interp::Interp::take_pending);
+        // Not while the picture is in layers: the frame in between has no
+        // layers of its own (the UI would jump between two places).
+        let layered = HW_FRONT.lock().unwrap().as_ref().is_some_and(|f| f.layered);
         if let Some((x, y, w, h)) = pending
+            && !layered
             && let Some(between) = g.hw.between.as_ref()
         {
-            latch_on_card(&g.hw, between, x, y, w, h);
+            latch_on_card(&g.hw, between, x, y, w, h, false);
             FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         return;
@@ -1468,6 +1642,17 @@ pub fn latch() {
     f.movie = None;
     crate::mods::movies::tick(d.rgb24 && d.enabled);
     let kept = g.hw.take_frame();
+    let mut shot_row = None;
+    if crate::present::tracking() {
+        let row = super::watch::aya_row();
+        // Outside the field, splits from before (a demo's) are stale.
+        if row.is_err() {
+            g.hw.splits.clear();
+        }
+        shot_row = Some(row);
+        let background = g.backgrounds.iter().find(|b| b.0 == (d.x, d.y)).map(|b| b.1);
+        super::watch::frame_row(row, background);
+    }
     if !d.rgb24 {
         let hw = &mut g.hw;
         let s = hw.scale as u32;
@@ -1475,8 +1660,24 @@ pub fn latch() {
         (f.width, f.height) = (w as usize, h as usize);
         let shown = (d.x as u32 * s, d.y as u32 * s, w, h);
         if d.enabled {
-            latch_on_card(hw, &hw.target, shown.0, shown.1, w, h);
+            let layered = hw.splits.contains(&(shown.0, shown.1));
+            latch_on_card(hw, &hw.target, shown.0, shown.1, w, h, layered);
             f.on_card = true;
+            // PE2_TRACE=panshots: the frames shown around camera cuts, as
+            // PNGs named by time, Aya's place and whether it was skipped.
+            if trace("panshots") && super::watch::near_cut() {
+                static SHOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if SHOTS.fetch_add(1, Relaxed) < 600 {
+                    let _ = std::fs::create_dir_all("pe2-panshots");
+                    let row = match shot_row {
+                        Some(Ok(Some(v))) => format!("{v:.3}"),
+                        Some(Ok(None)) => "unread".to_string(),
+                        _ => "none".to_string(),
+                    };
+                    let name = format!("pe2-panshots/{:09.3}-y{}-aya-{row}.png", super::spu::stamp(), d.y);
+                    save_card_region(&hw.target, shown, &name);
+                }
+            }
         }
         // The new frame was drawn into the other framebuffer, which the
         // game shows from the blank after next: the drawing area's.
@@ -1569,23 +1770,38 @@ fn apply_awaiting(g: &mut Gpu) -> bool {
 
 /// Copies the displayed region of the hardware layer (or of `source`, a
 /// texture of the same size) into HW_FRONT.
-fn latch_on_card(hw: &hw::Hw, source: &wgpu::Texture, x: u32, y: u32, w: u32, h: u32) {
+/// With `layered`, also the region's scene layer and UI marks (see
+/// Hw::split).
+fn latch_on_card(hw: &hw::Hw, source: &wgpu::Texture, x: u32, y: u32, w: u32, h: u32, layered: bool) {
     let Some(gfx) = crate::gfx::get() else { return };
     let mut front = HW_FRONT.lock().unwrap();
     if front.as_ref().is_none_or(|f| (f.width, f.height) != (w, h)) {
-        let texture = gfx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("front"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+        let texture = |label, format| {
+            gfx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        *front = Some(CardFront {
+            texture: texture("front", wgpu::TextureFormat::Rgba8Unorm),
+            scene: texture("front scene", wgpu::TextureFormat::Rgba8Unorm),
+            ui: texture("front ui", wgpu::TextureFormat::R8Unorm),
+            layered: false,
+            width: w,
+            height: h,
         });
-        *front = Some(CardFront { texture, width: w, height: h });
     }
-    let f = front.as_ref().unwrap();
+    let layered = layered && hw.scene.is_some();
+    let f = front.as_mut().unwrap();
+    f.layered = layered;
     let size = hw.target.size();
     // The displayed region, clipped to the layer (no wrapping).
     let (cw, ch) = (w.min(size.width.saturating_sub(x)), h.min(size.height.saturating_sub(y)));
@@ -1593,21 +1809,28 @@ fn latch_on_card(hw: &hw::Hw, source: &wgpu::Texture, x: u32, y: u32, w: u32, h:
         return;
     }
     let mut encoder = gfx.device.create_command_encoder(&Default::default());
-    encoder.copy_texture_to_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: source,
-            mip_level: 0,
-            origin: wgpu::Origin3d { x, y, z: 0 },
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyTextureInfo {
-            texture: &f.texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
-    );
+    let mut copy = |from: &wgpu::Texture, to: &wgpu::Texture| {
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: from,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: to,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+        );
+    };
+    copy(source, &f.texture);
+    if layered && let Some(scene) = hw.scene.as_ref() {
+        copy(scene, &f.scene);
+        copy(&hw.ui, &f.ui);
+    }
     gfx.queue.submit([encoder.finish()]);
 }
 

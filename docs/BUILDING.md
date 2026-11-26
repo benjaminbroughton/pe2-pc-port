@@ -120,6 +120,8 @@ Debug output:
   - graphics: `gpu` (command lists and display changes), `gpubig`
     (oversized polygons), `dma`, `vram`, `hw` and `present` (the renderer),
     `textures`, `pgxp` (vertices with and without exact positions),
+    `otdepth` (packets per ordering-table depth, and how many are 3D),
+    `pan` (widescreen: each frame's field state and Aya's place, cuts, crop),
     `interp`, `interpcheck` and `interpshots` (frames in between);
   - movies and sound: `stream` (movie frames), `mdec`, `movies` (movies
     beginning and ending, by hash), `xa` (XA audio sectors played), `spu`
