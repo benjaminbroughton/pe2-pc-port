@@ -65,6 +65,22 @@ original = 'OPTIONS'
 text = 'OPZIONI'
 
 [[string]]
+original = 'PC Settings'
+text = 'Impostazioni PC'
+
+[[string]]
+original = 'PC SETTINGS'
+text = 'IMPOSTAZIONI PC'
+
+[[string]]
+original = '''
+Open PE2PC's own settings.
+Press the } button to proceed.'''
+text = '''
+Apre le impostazioni di PE2PC.
+Premi } per continuare.'''
+
+[[string]]
 original = '(restart)'
 text = '(riavvio)'
 
