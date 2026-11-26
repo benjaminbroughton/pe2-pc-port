@@ -10,6 +10,9 @@
 > movies stay 4:3. It is a work in progress: expect visual glitches. Turn it
 > on in Options → Video (or the launcher) with **Widescreen**. For the stable
 > port, use [the original repository](https://github.com/Snaity-CORE/pe2-pc-port).
+>
+_______
+> ORIGINAL README
 
 <a href="https://recomplauncher.com/game/pe2-pc-port"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
 
