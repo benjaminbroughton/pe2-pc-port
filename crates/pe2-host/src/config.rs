@@ -152,6 +152,10 @@ pub struct Video {
     /// The picture at whole multiples of its height, with black borders
     /// (graphics card presentation; default off).
     pub integer_scaling: Option<bool>,
+    /// Widescreen (experimental): in a window wider than 4:3, the scene in
+    /// the field fills it, following Aya up and down, with the menus and
+    /// text kept 4:3 (default off).
+    pub widescreen: Option<bool>,
     /// The game's HUD (HP and MP, radar, ammunition, an enemy's HP):
     /// "default" (as the game draws it), "battle" (in battle only) or "off".
     pub hud: Option<String>,

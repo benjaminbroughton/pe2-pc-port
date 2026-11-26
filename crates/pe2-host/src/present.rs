@@ -494,10 +494,11 @@ fn viewport(ww: u32, wh: u32, tw: u32, th: u32, integer: bool) -> (u32, u32, u32
 pub static AYA_FY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(f32::NAN.to_bits());
 pub static AYA_CUTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// PE2_WIDESCREEN_TRACK=1: the strip follows Aya instead of staying put.
+/// The strip follows Aya instead of staying put: on unless
+/// PE2_WIDESCREEN_TRACK=0 (then PE2_WIDESCREEN_PAN places it).
 pub fn tracking() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PE2_WIDESCREEN_TRACK").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| std::env::var("PE2_WIDESCREEN_TRACK").map_or(true, |v| v.trim() != "0"))
 }
 
 struct Pan {
@@ -558,7 +559,7 @@ fn tracked_top(visible: f32) -> f32 {
     s.top = s.top.clamp(0.0, max_top);
     s.top
 }
-/// Widescreen POC. With PE2_WIDESCREEN_POC=1, a 4:3 picture in a window wider
+/// Widescreen. When on, a 4:3 picture in a window wider
 /// than 4:3 fills the window, showing a vertical strip of it: returns the
 /// strip's height as a fraction of the picture's, and where it starts (also a
 /// fraction). PE2_WIDESCREEN_PAN (0 = top ... 1 = bottom, default 0.5) picks
@@ -586,11 +587,14 @@ fn widescreen_crop(ww: u32, wh: u32, size: (u32, u32)) -> Option<(f32, f32)> {
     Some((visible, (1.0 - visible) * pan))
 }
 
-/// Widescreen (PE2_WIDESCREEN_POC=1): in the field, the scene fills a window
-/// wider than 4:3 and the UI is drawn over it at 4:3 (gpu's Hw::split).
+/// Widescreen: in the field, the scene fills a window wider than 4:3 and the
+/// UI is drawn over it at 4:3 (gpu's Hw::split). PE2_WIDESCREEN_POC (1 or 0),
+/// else the setting ([video] widescreen; the Options' Video).
 pub fn widescreen_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PE2_WIDESCREEN_POC").is_ok_and(|v| v.trim() == "1"))
+    static FORCED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    FORCED
+        .get_or_init(|| std::env::var("PE2_WIDESCREEN_POC").ok().map(|v| v.trim() == "1"))
+        .unwrap_or_else(|| crate::settings::flag(crate::settings::Id::Widescreen))
 }
 
 /// Whole multiples of the picture: PE2_INTEGER_SCALING, else the setting

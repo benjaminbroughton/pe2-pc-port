@@ -65,6 +65,10 @@ scale = 4
 # borders around), rather than filling the window. Clearest at internal
 # resolutions small enough to fit at 2x or more.
 # integer_scaling = false
+# Widescreen (experimental): in a window wider than 4:3, the scene in the
+# field fills it, following Aya up and down; the menus, text and movies stay
+# 4:3. Cutscenes and some effects may not frame well yet.
+# widescreen = false
 # The HUD (HP and MP, the radar, ammunition, a targeted enemy's HP):
 # "default" (as the game draws it), "battle" (only in battle) or "off".
 # The Parasite Energy wheel still opens on Triangle.
