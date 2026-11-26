@@ -546,7 +546,9 @@ enum Op {
     /// Widescreen: where a frame's scene ends and its UI begins. Copies the
     /// frame's rectangle of the target, as drawn so far, to the scene layer,
     /// and clears the UI marks there, so what is drawn after it is marked.
-    Split { x: u32, y: u32, w: u32, h: u32 },
+    /// `scene` false: only the marks are cleared, the scene layer kept (a
+    /// game menu's frame over the frozen field).
+    Split { x: u32, y: u32, w: u32, h: u32, scene: bool },
 }
 
 /// The format of the UI marks (the fragment shader's second target).
@@ -2018,10 +2020,12 @@ impl Hw {
         let mut encoder = device.create_command_encoder(&Default::default());
         let mut i = 0;
         while i < ops.len() {
-            if let Op::Split { x, y, w, h } = ops[i] {
+            if let Op::Split { x, y, w, h, scene: copy } = ops[i] {
                 if !replay && let (Some(scene), Some(zeros)) = (self.scene.as_ref(), self.zeros.as_ref()) {
                     let extent = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
-                    encoder.copy_texture_to_texture(origin_at(into, x, y), origin_at(scene, x, y), extent);
+                    if copy {
+                        encoder.copy_texture_to_texture(origin_at(into, x, y), origin_at(scene, x, y), extent);
+                    }
                     encoder.copy_texture_to_texture(zeros.as_image_copy(), origin_at(&self.ui, x, y), extent);
                 }
                 i += 1;
@@ -2140,6 +2144,19 @@ impl Hw {
     /// Widescreen: the frame at native (x, y), `w` x `h`, has drawn its
     /// scene; what follows is its UI (Op::Split).
     pub fn split(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        self.split_as(x, y, w, h, true);
+    }
+
+    /// Widescreen: clears the UI marks of the frame at native (x, y), `w`
+    /// x `h`, keeping its scene layer (a game menu's frame: what it draws
+    /// now is all there is of its UI).
+    pub fn clear_marks(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        if self.splits.contains(&(((x.max(0) * self.scale) as u32), ((y.max(0) * self.scale) as u32))) {
+            self.split_as(x, y, w, h, false);
+        }
+    }
+
+    fn split_as(&mut self, x: i32, y: i32, w: i32, h: i32, scene: bool) {
         let s = self.scale;
         let (x, y) = ((x.max(0) * s) as u32, (y.max(0) * s) as u32);
         let w = ((w * s) as u32).min(self.width.saturating_sub(x));
@@ -2160,7 +2177,7 @@ impl Hw {
                 view_formats: &[],
             }));
         }
-        self.ops.push(Op::Split { x, y, w, h });
+        self.ops.push(Op::Split { x, y, w, h, scene });
         if !self.splits.contains(&(x, y)) {
             self.splits.insert(0, (x, y));
             self.splits.truncate(4);

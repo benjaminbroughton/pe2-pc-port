@@ -89,6 +89,11 @@ pub struct Gpu {
     /// the screen or more), by where they went, as a fingerprint: the
     /// shown frame's tells a camera cut (watch::frame_row).
     backgrounds: Vec<((i32, i32), u64)>,
+    /// Widescreen: the backgrounds copied in (x, y, w, h) since the last
+    /// frame table was drawn. One under the next frame's drawing area is
+    /// that frame's scene, though it draws only UI (a close-up under a
+    /// dialogue box).
+    fresh_backdrops: Vec<(i32, i32, i32, i32)>,
 }
 
 /// A screen image a mod's picture replaced: where it went, its hash and
@@ -262,6 +267,7 @@ pub fn start() {
         backdrop: (None, None),
         backdrop_moving: 0,
         backgrounds: Vec::new(),
+        fresh_backdrops: Vec::new(),
     });
 }
 
@@ -972,6 +978,46 @@ fn covers_screen(words: &[u32], w: i32, h: i32) -> bool {
     }
 }
 
+/// PE2_TRACE=uipackets: the GP0 command's opcode and the box its vertices
+/// span (x0, y0, x1, y1), for polygons, rectangles and fills.
+fn packet_box(words: &[u32]) -> Option<(u32, i32, i32, i32, i32)> {
+    let &w0 = words.first()?;
+    let op = w0 >> 24;
+    let size = |i: usize| words.get(i).map(|s| ((s & 0x3FF) as i32, ((s >> 16) & 0x1FF) as i32));
+    match op {
+        0x02 => {
+            let (x, y) = xy(*words.get(1)?);
+            let (w, h) = size(2)?;
+            Some((op, x, y, x + w, y + h))
+        }
+        0x60..=0x7F => {
+            let (x, y) = xy(*words.get(1)?);
+            let (w, h) = match op & 0x18 {
+                0x00 => size(if op & 0x04 != 0 { 3 } else { 2 })?,
+                0x08 => (1, 1),
+                0x10 => (8, 8),
+                _ => (16, 16),
+            };
+            Some((op, x, y, x + w, y + h))
+        }
+        0x20..=0x3F => {
+            let (gouraud, quad, textured) = (op & 0x10 != 0, op & 0x08 != 0, op & 0x04 != 0);
+            let mut i = 1;
+            let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+            for k in 0..if quad { 4 } else { 3 } {
+                if gouraud && k > 0 {
+                    i += 1;
+                }
+                let (x, y) = xy(*words.get(i)?);
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                i += 1 + usize::from(textured);
+            }
+            Some((op, x0, y0, x1, y1))
+        }
+        _ => Some((op, 0, 0, 0, 0)),
+    }
+}
+
 /// Whether DrawOTag(`start`) walks one of the game's frame ordering tables.
 fn is_frame_ot(start: *const u32) -> bool {
     let base = (start as u32).wrapping_sub((OT_TAGS - 1) * 4);
@@ -982,6 +1028,10 @@ fn is_frame_ot(start: *const u32) -> bool {
 /// base. Measured (PE2_TRACE=otdepth): the HUD draws at -2 and -1, dialogue
 /// at 2, 3 and 9, text at 4; the rooms' masks and 3D from 34 on.
 const UI_DEPTH: i32 = 16;
+/// The same over a background copied in under a frame drawing no scene of
+/// its own (a close-up): measured (PE2_TRACE=uipackets), its effects at 9,
+/// the dialogue box at 3 and its text and name at 2.
+const BACKDROP_UI_DEPTH: i32 = 9;
 
 /// The depth (relative to the game's depth base) of `node` when it is one of
 /// the tags of the table DrawOTag(`start`) walks, if `start` is a frame table.
@@ -1055,9 +1105,64 @@ pub extern "C" fn pcrt_DrawOTag(p: *const u32) {
         // drawing only UI (the game freezes the picture under a dialogue
         // box) keeps the scene of the last.
         let split = crate::present::widescreen_on() && is_frame_ot(p);
-        let (mut scene, mut split_done) = (false, false);
         let frame_area = (g.state.area_x1, g.state.area_y1, g.display.width, g.display.height);
+        // A background copied in under the drawing area since the last
+        // frame: the scene, even when the frame draws only UI over it.
+        let backdrop = split
+            && g.fresh_backdrops.iter().any(|&(x, y, w, h)| {
+                x < frame_area.0 + frame_area.2
+                    && frame_area.0 < x + w
+                    && y < frame_area.1 + frame_area.3
+                    && frame_area.1 < y + h
+            });
+        if split {
+            g.fresh_backdrops.clear();
+        }
+        let (mut scene, mut split_done) = (backdrop, false);
+        // Over such a background, its effects from depth 9 on are scene too
+        // (the phone's glowing light in a close-up; the dialogue there is
+        // at 2 and 3).
+        let ui_depth = if backdrop { BACKDROP_UI_DEPTH } else { UI_DEPTH };
         let mut bucket: Option<i32> = None;
+        let menu = !split && crate::present::tracking() && super::watch::menu_over_field();
+        let uipackets = (split || menu) && trace("uipackets");
+        // A game menu over the frozen field draws all of its UI in each
+        // draw (measured: the item menu's 423 packets every time): its marks
+        // start clear, and a picture copied in under it since the last draw
+        // (the frozen field, darkened) is its scene.
+        if menu {
+            let fresh = g.fresh_backdrops.iter().any(|&(x, y, w, h)| {
+                x < frame_area.0 + frame_area.2
+                    && frame_area.0 < x + w
+                    && y < frame_area.1 + frame_area.3
+                    && frame_area.1 < y + h
+            });
+            g.fresh_backdrops.clear();
+            if fresh {
+                g.hw.split(frame_area.0, frame_area.1, frame_area.2, frame_area.3);
+            } else {
+                g.hw.clear_marks(frame_area.0, frame_area.1, frame_area.2, frame_area.3);
+            }
+            if trace("pan") {
+                static COUNT: Mutex<(u32, Option<std::time::Instant>, u32)> = Mutex::new((0, None, 0));
+                let mut c = COUNT.lock().unwrap();
+                c.0 += 1;
+                c.2 += u32::from(fresh);
+                let at = *c.1.get_or_insert_with(std::time::Instant::now);
+                if at.elapsed().as_secs() >= 1 {
+                    eprintln!(
+                        "[pan {:8.3}] game menu: {} draws in the last second, {} over a new picture, at ({}, {})",
+                        super::spu::stamp(),
+                        c.0,
+                        c.2,
+                        frame_area.0,
+                        frame_area.1
+                    );
+                    *c = (0, Some(std::time::Instant::now()), 0);
+                }
+            }
+        }
+        let mut packet_list = Vec::new();
         loop {
             if depths || split {
                 bucket = ot_bucket(p, node).or(bucket);
@@ -1071,12 +1176,15 @@ pub extern "C" fn pcrt_DrawOTag(p: *const u32) {
                 words.extend((1..=len).map(|i| unsafe { node.add(i).read() }));
                 g.cur_packet = node as u32;
                 if split && !split_done {
-                    if bucket.is_some_and(|b| b >= UI_DEPTH) {
+                    if bucket.is_some_and(|b| b >= ui_depth) {
                         scene = true;
                     } else if scene {
                         g.hw.split(frame_area.0, frame_area.1, frame_area.2, frame_area.3);
                         split_done = true;
                     }
+                }
+                if uipackets {
+                    packet_list.push((bucket, packet_box(&words)));
                 }
                 let before = (POLY_VERTICES.load(Relaxed), EXACT_VERTICES.load(Relaxed));
                 g.run(&words, node as u32 + 4);
@@ -1084,11 +1192,17 @@ pub extern "C" fn pcrt_DrawOTag(p: *const u32) {
                 // (all of the window fades), so the scene is taken again.
                 if split
                     && scene
-                    && bucket.is_some_and(|b| b < UI_DEPTH)
+                    && bucket.is_some_and(|b| b < ui_depth)
                     && covers_screen(&words, frame_area.2, frame_area.3)
                 {
                     g.hw.split(frame_area.0, frame_area.1, frame_area.2, frame_area.3);
                     split_done = true;
+                }
+                // A game menu's fade over the whole picture (measured: a
+                // semi-transparent rectangle, its first draws): part of the
+                // scene.
+                if menu && covers_screen(&words, frame_area.2, frame_area.3) {
+                    g.hw.split(frame_area.0, frame_area.1, frame_area.2, frame_area.3);
                 }
                 if depths {
                     let polys = POLY_VERTICES.load(Relaxed) - before.0;
@@ -1105,6 +1219,51 @@ pub extern "C" fn pcrt_DrawOTag(p: *const u32) {
         // A scene and no UI: all of it is scene (no marks left from before).
         if scene && !split_done {
             g.hw.split(frame_area.0, frame_area.1, frame_area.2, frame_area.3);
+        }
+        // PE2_TRACE=uipackets: every 2 s, one UI-only frame's packets.
+        if uipackets && !scene {
+            static AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+            let mut at = AT.lock().unwrap();
+            if at.is_none_or(|t| t.elapsed().as_secs() >= 2) {
+                *at = Some(std::time::Instant::now());
+                eprintln!(
+                    "[uipackets {:8.3}] {} at 0x{:08X}, area ({}, {}), {} packets:",
+                    super::spu::stamp(),
+                    if menu { "game menu draw" } else { "UI-only frame" },
+                    p as u32,
+                    frame_area.0,
+                    frame_area.1,
+                    packet_list.len()
+                );
+                for (b, p) in &packet_list {
+                    match p {
+                        Some((op, x0, y0, x1, y1)) => {
+                            eprintln!("  depth {b:?} op {op:02X} box ({x0}, {y0})-({x1}, {y1})")
+                        }
+                        None => eprintln!("  depth {b:?} (short)"),
+                    }
+                }
+            }
+        }
+        if split && trace("pan") {
+            static LAST: Mutex<Option<(bool, bool, i32, i32)>> = Mutex::new(None);
+            let now = (scene, split_done, frame_area.0, frame_area.1);
+            let mut last = LAST.lock().unwrap();
+            if *last != Some(now) {
+                *last = Some(now);
+                eprintln!(
+                    "[pan {:8.3}] drawn at ({}, {}){}: {}",
+                    super::spu::stamp(),
+                    frame_area.0,
+                    frame_area.1,
+                    if backdrop { " over a new background" } else { "" },
+                    match (scene, split_done) {
+                        (true, true) => "scene and UI",
+                        (true, false) => "scene only",
+                        (false, _) => "UI only (keeps the last scene)",
+                    }
+                );
+            }
         }
         g.frame += 1;
         if g.dump_out.take().is_some() {
@@ -1180,6 +1339,10 @@ pub extern "C" fn pcrt_LoadImage(rect: *const Rect, p: *const u16) -> i32 {
         g.vram.write_rect(x0, y0, w, h, pixels);
         g.post(x0, y0, w, h);
         g.note_backdrop(w, h, || pixels.to_vec());
+        if w * h >= BACKDROP_PIXELS && crate::present::widescreen_on() {
+            g.fresh_backdrops.push((x0, y0, w, h));
+            g.fresh_backdrops.truncate(8);
+        }
         if w * h >= BACKDROP_PIXELS && crate::present::tracking() {
             let print = fingerprint(pixels);
             g.backgrounds.retain(|b| b.0 != (x0, y0));
