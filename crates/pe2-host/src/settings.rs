@@ -32,6 +32,7 @@ pub enum Id {
     IntegerScaling,
     Fullscreen,
     HdFonts,
+    Hud,
     Volume,
     Movement,
     QuickTurn,
@@ -166,6 +167,20 @@ const DEFS: &[Def] = &[
         choices: ON_OFF,
         default: 1,
         live: false,
+    },
+    Def {
+        id: Id::Hud,
+        category: 0,
+        label: "HUD",
+        section: "video",
+        key: "hud",
+        choices: &[
+            ("Default", Value::Str("default")),
+            ("In battle only", Value::Str("battle")),
+            ("Off", Value::Str("off")),
+        ],
+        default: 0,
+        live: true,
     },
     Def {
         id: Id::Volume,
@@ -397,6 +412,7 @@ fn from_config(def: &Def) -> usize {
         Id::IntegerScaling => c.video.integer_scaling.map(Value::Bool),
         Id::Fullscreen => c.video.fullscreen.map(Value::Bool),
         Id::HdFonts => c.video.hd_fonts.map(Value::Bool),
+        Id::Hud => c.video.hud.as_deref().map(|s| Value::Str(leak(s.trim()))),
         Id::Volume => c.audio.volume.map(|v| Value::Int(v.into())),
         Id::Movement => c.input.movement.as_deref().map(|s| Value::Str(leak(s.trim()))),
         Id::QuickTurn => c.input.quick_turn.map(Value::Bool),
@@ -505,6 +521,17 @@ pub fn texts() -> Vec<&'static str> {
     let mut seen = std::collections::HashSet::new();
     out.retain(|t| seen.insert(*t));
     out
+}
+
+/// The HUD setting ([video] hud) for the game's HUD drawing (hud.h in the
+/// fork): 0 as the game draws it, 1 only in battle, 2 never.
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_hud_mode() -> i32 {
+    match word(Id::Hud) {
+        "battle" => 1,
+        "off" => 2,
+        _ => 0,
+    }
 }
 
 // ---- the menu's side (src/main/pc/menu.c) ----

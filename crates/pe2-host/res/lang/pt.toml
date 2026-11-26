@@ -153,6 +153,18 @@ original = 'Integer scaling'
 text = 'Escala inteira'
 
 [[string]]
+original = 'HUD'
+text = 'HUD'
+
+[[string]]
+original = 'Default'
+text = 'Padrão'
+
+[[string]]
+original = 'In battle only'
+text = 'Só em batalha'
+
+[[string]]
 original = 'Full screen'
 text = 'Tela cheia'
 

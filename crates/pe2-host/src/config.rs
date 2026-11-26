@@ -152,6 +152,9 @@ pub struct Video {
     /// The picture at whole multiples of its height, with black borders
     /// (graphics card presentation; default off).
     pub integer_scaling: Option<bool>,
+    /// The game's HUD (HP and MP, radar, ammunition, an enemy's HP):
+    /// "default" (as the game draws it), "battle" (in battle only) or "off".
+    pub hud: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
