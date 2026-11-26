@@ -153,6 +153,10 @@ original = 'Integer scaling'
 text = 'Escala inteira'
 
 [[string]]
+original = 'Widescreen'
+text = 'Tela panorâmica'
+
+[[string]]
 original = 'Full screen'
 text = 'Tela cheia'
 

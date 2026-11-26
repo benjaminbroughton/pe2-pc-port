@@ -65,6 +65,10 @@ scale = 4
 # borders around), rather than filling the window. Clearest at internal
 # resolutions small enough to fit at 2x or more.
 # integer_scaling = false
+# Widescreen (experimental): in a window wider than 4:3, the scene in the
+# field fills it, following Aya up and down; the menus, text and movies stay
+# 4:3. Cutscenes and some effects may not frame well yet.
+# widescreen = false
 # The graphics API: "auto" (Vulkan, else OpenGL), "vulkan" or "opengl".
 # If Vulkan crashed while starting (a driver or an overlay hooking into
 # it), "auto" uses OpenGL from then on (vulkan-crashed.txt in the data

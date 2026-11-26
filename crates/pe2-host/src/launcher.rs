@@ -421,6 +421,8 @@ struct Settings {
     interpolation: bool,
     crt: bool,
     integer_scaling: bool,
+    /// [video] widescreen.
+    widescreen: bool,
     /// [video] hd_fonts.
     hd_fonts: bool,
     /// [video] graphics_api: "auto", "vulkan" or "opengl".
@@ -475,6 +477,7 @@ impl Settings {
             interpolation: flag("video", "frame_interpolation", true),
             crt: flag("video", "crt", false),
             integer_scaling: flag("video", "integer_scaling", false),
+            widescreen: flag("video", "widescreen", false),
             hd_fonts: flag("video", "hd_fonts", true),
             graphics_api: get("video", "graphics_api")
                 .and_then(|v| v.as_str())
@@ -552,6 +555,7 @@ impl Settings {
         doc["video"]["frame_interpolation"] = value(self.interpolation);
         doc["video"]["crt"] = value(self.crt);
         doc["video"]["integer_scaling"] = value(self.integer_scaling);
+        doc["video"]["widescreen"] = value(self.widescreen);
         doc["video"]["hd_fonts"] = value(self.hd_fonts);
         doc["video"]["graphics_api"] = value(self.graphics_api.as_str());
         doc["video"]["window_size"] = value(self.window_size.as_str());
@@ -1135,6 +1139,12 @@ impl Launcher {
             ui,
             &mut e.integer_scaling,
             lang.t("Integer scaling (sharp, with borders)", "Escala inteira (nítida, com bordas)"),
+            true,
+        );
+        f.checkbox(
+            ui,
+            &mut e.widescreen,
+            lang.t("Widescreen (experimental)", "Tela panorâmica (experimental)"),
             true,
         );
         f.checkbox(
