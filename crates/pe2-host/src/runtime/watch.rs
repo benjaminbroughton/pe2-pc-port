@@ -84,6 +84,39 @@ fn in_field() -> bool {
     }
 }
 
+/// gDisplayState (screenDistance, at +0x110, is 0x80071078).
+const DISPLAY_STATE: u32 = 0x8007_0F68;
+
+/// One of the game's own menus has the screen: the display handed to a
+/// transition task (displayOwner 1) for a game menu (pendingMode 0x40-0x4F,
+/// measured 0x41 for the item menu; not the map, 0x43) or a descriptor task
+/// (0x81: the save prompt).
+fn game_menu() -> bool {
+    // SAFETY: fixed addresses inside PSX RAM, mapped for the process's life.
+    let rd8 = |o: u32| unsafe { ((DISPLAY_STATE + o) as usize as *const u8).read() };
+    let (owner, mode) = (rd8(0x1E), rd8(0x10D));
+    owner == 1 && ((mode & 0xF0 == 0x40 && mode != 0x43) || mode == 0x81)
+}
+
+/// A game menu opened from field play (see `game_menu`), until it closes:
+/// the frozen field stays widescreen behind it.
+pub fn menu_over_field() -> bool {
+    static OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !game_menu() {
+        // Closed: the field it returns to counts as live from now (its
+        // first frame is held, long after the last live one).
+        if OVER.swap(false, Ordering::Relaxed) {
+            LIVE_AT.store(field_clock(), Ordering::Relaxed);
+        }
+        return false;
+    }
+    if !OVER.load(Ordering::Relaxed) && in_field() {
+        OVER.store(true, Ordering::Relaxed);
+        eprintln!("[wide {:8.3}] game menu over the field", super::spu::stamp());
+    }
+    OVER.load(Ordering::Relaxed)
+}
+
 fn watched() -> &'static [u32] {
     WATCHED.get_or_init(|| {
         std::env::var("PE2_WATCH")
@@ -189,6 +222,10 @@ pub type Row = Result<Option<f32>, ()>;
 pub fn aya_row() -> Row {
     const COORD_MTX: u32 = 0x8007_3B8C; // gPlayerStatus + 4
     const SCREEN_DISTANCE: u32 = 0x8007_1078; // gDisplayState + 0x110
+    // A game menu over the frozen field: held where it was (infinity).
+    if menu_over_field() {
+        return Ok(Some(f32::INFINITY));
+    }
     if !in_field() {
         return Err(());
     }
@@ -262,9 +299,28 @@ pub fn frame_row(row: Row, background: Option<u64>) {
             Ok(None) => "unread".to_string(),
             Ok(Some(v)) => format!("{v:.3}"),
         };
-        eprintln!("[pan {:8.3}] frame: field {state}, Aya at {row}", super::spu::stamp());
+        // gDisplayState's displayOwner (+0x1E), pendingMode (+0x10D),
+        // height (+0x1A) and gameMode (+0x11E).
+        // SAFETY: fixed addresses inside PSX RAM, mapped for the process's life.
+        let rd8 = |o: u32| unsafe { ((DISPLAY_STATE + o) as usize as *const u8).read() };
+        let height = unsafe { ((DISPLAY_STATE + 0x1A) as usize as *const i16).read_unaligned() };
+        eprintln!(
+            "[pan {:8.3}] frame: field {state}, Aya at {row}, owner {} mode 0x{:02X} height {height} gameMode {}",
+            super::spu::stamp(),
+            rd8(0x1E),
+            rd8(0x10D),
+            rd8(0x11E)
+        );
     }
-    let row = row.map(|r| r.filter(|v| (-0.25..=1.25).contains(v)));
+    // A game menu over the field (aya_row): the strip held, nothing else
+    // changed.
+    if row == Ok(Some(f32::INFINITY)) {
+        publish(f32::INFINITY);
+        return;
+    }
+    let on_picture = |v: &f32| (-0.25..=1.25).contains(v);
+    let off_picture = matches!(row, Ok(Some(v)) if !on_picture(&v));
+    let row = row.map(|r| r.filter(on_picture));
     match row {
         Err(()) => {
             (t.good, t.at, t.ignored) = (None, None, 0);
@@ -273,7 +329,10 @@ pub fn frame_row(row: Row, background: Option<u64>) {
         Ok(None) => {
             if t.at.is_none_or(|at| at.elapsed().as_millis() as u64 >= FIELD_HOLD_MS) {
                 (t.good, t.at, t.ignored) = (None, None, 0);
-                publish(f32::NAN);
+                // Aya read off the picture for a while (a scene's dialogue
+                // looking elsewhere): the crop stays, the strip held where
+                // it is (infinity). No reading at all: no player (NaN).
+                publish(if off_picture { f32::INFINITY } else { f32::NAN });
             }
         }
         Ok(Some(v)) => {

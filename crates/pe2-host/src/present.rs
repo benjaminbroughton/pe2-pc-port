@@ -489,7 +489,7 @@ fn viewport(ww: u32, wh: u32, tw: u32, th: u32, integer: bool) -> (u32, u32, u32
     ((ww - pw) / 2, (wh - ph) / 2, pw, ph, whole)
 }
 /// Aya's row on the screen as a fraction of the picture's height (NaN when
-/// there is no player), and a counter that rises at each camera cut. Both
+/// there is no player, infinity when she is off the picture), and a counter that rises at each camera cut. Both
 /// are written by the tracker thread in `runtime/watch.rs`.
 pub static AYA_FY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(f32::NAN.to_bits());
 pub static AYA_CUTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -529,6 +529,12 @@ fn tracked_top(visible: f32) -> f32 {
     s.cuts = cuts;
     if fy.is_nan() {
         s.target = centre;
+    } else if fy.is_infinite() {
+        // The field without Aya on the picture: hold the strip (to the
+        // middle at a cut).
+        if cut {
+            s.target = centre;
+        }
     } else {
         if cut {
             s.target = centre;
