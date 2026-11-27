@@ -337,9 +337,10 @@ fn aya_extent(coord_mtx: u32, h: i64) -> Option<(f32, f32)> {
 
 /// The pan tracker's state (see `frame_row`).
 struct Track {
-    /// The last reading, and when it was taken.
+    /// The last reading, when it was taken, and the background shown then.
     good: Option<f32>,
     at: Option<Instant>,
+    good_background: Option<u64>,
     /// The shown frame's background, frames shown since it changed, and
     /// jumps ignored in a row.
     background: Option<u64>,
@@ -347,7 +348,7 @@ struct Track {
     ignored: u32,
 }
 static TRACK: std::sync::Mutex<Track> =
-    std::sync::Mutex::new(Track { good: None, at: None, background: None, since_cut: u32::MAX, ignored: 0 });
+    std::sync::Mutex::new(Track { good: None, at: None, good_background: None, background: None, since_cut: u32::MAX, ignored: 0 });
 
 /// PE2_TRACE=panshots: whether the frame being shown is near a camera cut
 /// (held out of live play, or within ten frames after a cut).
@@ -363,7 +364,14 @@ pub fn near_cut() -> bool {
 /// there at once. A jump with the same background is the game's state
 /// ahead of the picture (it shows the old view for a moment at a cut):
 /// ignored, unless it lasts. A place far off the picture is no reading.
-pub fn frame_row(row: Row, background: Option<u64>) {
+///
+/// Not the field (Err) while the picture is still the one Aya was last read
+/// on (the same background, within FIELD_HOLD_MS) is held: entering a door,
+/// the game stalls on the frozen room (measured 370 ms, its first frame
+/// after without a player) and hands the screen to its fade (displayOwner
+/// 2, 340 ms after the last live frame); each was a 4:3 frame. Returns
+/// whether the field is off (the crop off: splits from before are stale).
+pub fn frame_row(row: Row, background: Option<u64>) -> bool {
     use std::sync::atomic::Ordering::{Relaxed, Release};
     const JUMP: f32 = 0.15;
     const CATCH_UP_FRAMES: u32 = 4;
@@ -406,7 +414,16 @@ pub fn frame_row(row: Row, background: Option<u64>) {
     // changed.
     if row == Ok(Some(f32::INFINITY)) {
         publish(f32::INFINITY);
-        return;
+        return false;
+    }
+    let frozen = t.good.is_some()
+        && t.background == t.good_background
+        && t.at.is_some_and(|at| (at.elapsed().as_millis() as u64) < FIELD_HOLD_MS);
+    if row.is_err() && frozen {
+        if pan {
+            eprintln!("[pan {:8.3}] not the field, on the same picture: held", super::spu::stamp());
+        }
+        return false;
     }
     let on_picture = |v: &f32| (-0.25..=1.25).contains(v);
     let off_picture = matches!(row, Ok(Some(v)) if !on_picture(&v));
@@ -415,6 +432,7 @@ pub fn frame_row(row: Row, background: Option<u64>) {
         Err(()) => {
             (t.good, t.at, t.ignored) = (None, None, 0);
             publish(f32::NAN);
+            return true;
         }
         Ok(None) => {
             if t.at.is_none_or(|at| at.elapsed().as_millis() as u64 >= FIELD_HOLD_MS) {
@@ -432,10 +450,11 @@ pub fn frame_row(row: Row, background: Option<u64>) {
                 if pan {
                     eprintln!("[pan {:8.3}] jump with the same background: ignored", super::spu::stamp());
                 }
-                return;
+                return false;
             }
             let cut = jump || t.good.is_none();
             (t.good, t.at, t.ignored) = (Some(v), Some(Instant::now()), 0);
+            t.good_background = t.background;
             // Her extent, read with this row, published before it.
             crate::present::AYA_TOP.store(PENDING_EXTENT.0.load(Relaxed), Relaxed);
             crate::present::AYA_BOTTOM.store(PENDING_EXTENT.1.load(Relaxed), Relaxed);
@@ -448,6 +467,7 @@ pub fn frame_row(row: Row, background: Option<u64>) {
             }
         }
     }
+    false
 }
 
 /// Starts PE2_PEEK, if set.

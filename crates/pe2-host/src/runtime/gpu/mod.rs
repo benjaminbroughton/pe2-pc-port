@@ -1190,13 +1190,26 @@ pub extern "C" fn pcrt_DrawOTag(p: *const u32) {
                 g.run(&words, node as u32 + 4);
                 // A fade over the whole picture, in front: part of the scene
                 // (all of the window fades), so the scene is taken again.
+                // Also in a frame drawing only UI (entering a door: the
+                // frozen room under its fade, measured 'UI only' for about
+                // 1.5 s): what it fades is the picture, the scene from here.
                 if split
-                    && scene
                     && bucket.is_some_and(|b| b < ui_depth)
                     && covers_screen(&words, frame_area.2, frame_area.3)
                 {
+                    if !scene && trace("pan") {
+                        eprintln!(
+                            "[pan {:8.3}] a fade over a frame drawing only UI at ({}, {}) (depth {bucket:?}, op {:02X}, colour {:06X}, semi mode {}): scene",
+                            super::spu::stamp(),
+                            frame_area.0,
+                            frame_area.1,
+                            words[0] >> 24,
+                            words[0] & 0xFF_FFFF,
+                            g.state.semi_mode
+                        );
+                    }
                     g.hw.split(frame_area.0, frame_area.1, frame_area.2, frame_area.3);
-                    split_done = true;
+                    (scene, split_done) = (true, true);
                 }
                 // A game menu's fade over the whole picture (measured: a
                 // semi-transparent rectangle, its first draws): part of the
@@ -1808,13 +1821,12 @@ pub fn latch() {
     let mut shot_row = None;
     if crate::present::tracking() {
         let row = super::watch::aya_row();
-        // Outside the field, splits from before (a demo's) are stale.
-        if row.is_err() {
-            g.hw.splits.clear();
-        }
         shot_row = Some(row);
         let background = g.backgrounds.iter().find(|b| b.0 == (d.x, d.y)).map(|b| b.1);
-        super::watch::frame_row(row, background);
+        // Outside the field, splits from before (a demo's) are stale.
+        if super::watch::frame_row(row, background) {
+            g.hw.splits.clear();
+        }
     }
     if !d.rgb24 {
         let hw = &mut g.hw;
