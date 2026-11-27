@@ -55,6 +55,7 @@ What a mod can hold, each part optional, and where each is explained:
 | `files/` | any of the game's files, or chunks of them | Game files |
 | `text/` | the dialogue, and the speakers' names (`text/speakers.toml`) | Dialogue |
 | `fonts/` | the dialogue's font | Dialogue in your own font |
+| `voice/` | recordings of dialogue lines | Voiced dialogue |
 | `strings/` | the menus' texts, items' details | Texts of the menus |
 | `patches.toml` | the game's memory (cheats) | Cheats and memory patches |
 
@@ -839,6 +840,28 @@ lines inside the screen.
 For mods that redraw the glyph pictures instead (indexed replacements of
 the pages), the extract also maps each dialogue glyph page: see "Text
 redrawn from fonts" under Textures.
+
+### Voiced dialogue
+
+A mod can give a line of dialogue a recording (OGG Vorbis, FLAC or WAV, any
+sample rate, mono or stereo), which plays as the line appears. A line is
+named as translations name it, by its dialogue file and record:
+
+```text
+mods/<your mod>/voice/<cap>/<record>.ogg
+mods/my-voices/voice/1f9d66fcd224f2dd/117C.ogg
+```
+
+The folder is the `cap` of the file in `dumps/text/`, and the file's name is
+the line's `record`, in hexadecimal (`117C` or `0x117C`). To find a line
+without the extract, run the game with `PE2_TRACE=voice`: every line is
+named in the log as it appears, with the recording it played, if any.
+
+A recording stops when the player moves on, and when the dialogue ends or
+is skipped. A line that moves on by itself (in the scenes timed to their
+sound) stays on screen until its recording has finished, so a recording
+longer than the line slows the scene down. Recordings are mixed like the
+music's, at their own loudness.
 
 ## Texts of the menus
 

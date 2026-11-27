@@ -118,10 +118,10 @@ fn index() -> &'static HashMap<u8, (PathBuf, TrackSettings)> {
 
 /// A decoded recording: 44.1 kHz stereo frames, and the loop points its
 /// tags give (start, end), if any.
-type Decoded = (Vec<(i16, i16)>, Option<(usize, usize)>);
+pub(super) type Decoded = (Vec<(i16, i16)>, Option<(usize, usize)>);
 
-/// Decodes a recording to 44.1 kHz stereo.
-fn decode(path: &Path) -> Result<Decoded, String> {
+/// Decodes a recording to 44.1 kHz stereo (also voice.rs's clips).
+pub(super) fn decode(path: &Path) -> Result<Decoded, String> {
     let ext = path.extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
     let (interleaved, channels, rate, tags) = match ext.as_str() {
         "ogg" => {

@@ -578,7 +578,7 @@ pub extern "C" fn pc_cap_translate(file: *mut u8) -> *mut u8 {
     // Not interrupted while holding the log, a lock or the heap.
     let _g = crate::runtime::irq::guard();
     let own_font = super::capfont::active();
-    if (translations().is_empty() && !own_font) || file.is_null() {
+    if file.is_null() {
         return file;
     }
     let read = |at: usize| {
@@ -586,6 +586,21 @@ pub extern "C" fn pc_cap_translate(file: *mut u8) -> *mut u8 {
         // bundle the game loaded.
         unsafe { file.add(at).cast::<u32>().read_unaligned() }
     };
+    // Voiced lines (voice.rs) know a line by its file's hash, as here.
+    if super::voice::wanted() && read(8) as i32 > 0 {
+        let commands = read(16) as usize;
+        let len = commands + 4 + read(commands) as usize * 4;
+        if len <= 1 << 20 {
+            // SAFETY: as above, `len` bytes of it.
+            let bytes = unsafe { std::slice::from_raw_parts(file, len) };
+            if let Some(cap) = Cap::new(bytes) {
+                super::voice::note_cap(file, cap.hash());
+            }
+        }
+    }
+    if translations().is_empty() && !own_font {
+        return file;
+    }
     let mut live = live().lock().unwrap();
     // Loaded again where it already is, relocated: as given before. Its
     // offsets are then addresses: on the console negative (KSEG0), here the
@@ -649,6 +664,7 @@ pub extern "C" fn pc_cap_translate(file: *mut u8) -> *mut u8 {
     trace(&format!("a copy with {} glyph rows", translated.rows));
     let copy: Box<[u32]> = translated.words.clone().into_boxed_slice();
     let ptr = copy.as_ptr() as *mut u8;
+    super::voice::note_copy(file, ptr);
     live.insert(file as usize, Live { translated, copy });
     ptr
 }

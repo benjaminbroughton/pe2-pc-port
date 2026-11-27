@@ -10,9 +10,9 @@
 //!
 //! Backgrounds and full-screen pictures: backgrounds.rs; music: music.rs;
 //! movies: movies.rs; game files: files.rs; dialogue: dialogue/ and
-//! translate.rs; the menus' texts: strings.rs; textures: here (the
-//! libraries) and runtime/gpu/textures.rs; cheats and memory patches:
-//! patches.rs. Here: what is installed, the libraries of pictures they
+//! translate.rs; voiced dialogue: voice.rs; the menus' texts: strings.rs;
+//! textures: here (the libraries) and runtime/gpu/textures.rs; cheats and
+//! memory patches: patches.rs. Here: what is installed, the libraries of pictures they
 //! supply (loaded as wanted, within a budget), and the start.
 
 use std::collections::HashMap;
@@ -43,6 +43,7 @@ pub mod rooms;
 pub mod sheets;
 pub mod strings;
 pub mod translate;
+pub mod voice;
 
 pub use backgrounds::{background, background_wait, file_read, has_background, place_name, wants_screens};
 pub use patches::apply_patches;
