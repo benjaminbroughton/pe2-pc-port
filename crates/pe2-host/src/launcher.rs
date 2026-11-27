@@ -1141,12 +1141,7 @@ impl Launcher {
             lang.t("Integer scaling (sharp, with borders)", "Escala inteira (nítida, com bordas)"),
             true,
         );
-        f.checkbox(
-            ui,
-            &mut e.widescreen,
-            lang.t("Widescreen (experimental)", "Tela panorâmica (experimental)"),
-            true,
-        );
+        f.checkbox(ui, &mut e.widescreen, lang.t("Widescreen (experimental)", "Tela panorâmica (experimental)"), true);
         f.checkbox(
             ui,
             &mut e.fullscreen,

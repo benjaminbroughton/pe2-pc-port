@@ -1193,10 +1193,7 @@ pub extern "C" fn pcrt_DrawOTag(p: *const u32) {
                 // Also in a frame drawing only UI (entering a door: the
                 // frozen room under its fade, measured 'UI only' for about
                 // 1.5 s): what it fades is the picture, the scene from here.
-                if split
-                    && bucket.is_some_and(|b| b < ui_depth)
-                    && covers_screen(&words, frame_area.2, frame_area.3)
-                {
+                if split && bucket.is_some_and(|b| b < ui_depth) && covers_screen(&words, frame_area.2, frame_area.3) {
                     if !scene && trace("pan") {
                         eprintln!(
                             "[pan {:8.3}] a fade over a frame drawing only UI at ({}, {}) (depth {bucket:?}, op {:02X}, colour {:06X}, semi mode {}): scene",

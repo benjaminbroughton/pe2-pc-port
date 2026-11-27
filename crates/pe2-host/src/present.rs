@@ -554,7 +554,8 @@ fn tracked_top(visible: f32) -> f32 {
         if cut {
             s.target = centre;
         }
-        let (above, below) = if head <= feet { (head - EDGE_ABOVE, feet + EDGE_BELOW) } else { (fy - MARGIN_ABOVE, fy + MARGIN_BELOW) };
+        let (above, below) =
+            if head <= feet { (head - EDGE_ABOVE, feet + EDGE_BELOW) } else { (fy - MARGIN_ABOVE, fy + MARGIN_BELOW) };
         if below - above > visible {
             // More of her than fits: her head, as far down as the strip goes.
             s.target = above;

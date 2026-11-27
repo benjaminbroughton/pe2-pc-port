@@ -347,8 +347,14 @@ struct Track {
     since_cut: u32,
     ignored: u32,
 }
-static TRACK: std::sync::Mutex<Track> =
-    std::sync::Mutex::new(Track { good: None, at: None, good_background: None, background: None, since_cut: u32::MAX, ignored: 0 });
+static TRACK: std::sync::Mutex<Track> = std::sync::Mutex::new(Track {
+    good: None,
+    at: None,
+    good_background: None,
+    background: None,
+    since_cut: u32::MAX,
+    ignored: 0,
+});
 
 /// PE2_TRACE=panshots: whether the frame being shown is near a camera cut
 /// (held out of live play, or within ten frames after a cut).
