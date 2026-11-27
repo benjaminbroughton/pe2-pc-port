@@ -85,6 +85,14 @@ Abre as opções do PE2PC.
 Pressione } para continuar.'''
 
 [[string]]
+original = 'Debug'
+text = 'Depuração'
+
+[[string]]
+original = 'DEBUG'
+text = 'DEPURACAO'
+
+[[string]]
 original = '(restart)'
 text = '(reiniciar)'
 
