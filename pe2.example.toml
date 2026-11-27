@@ -171,3 +171,8 @@ scale = 4
 # folder, with the memory card it started with, to play it back later with
 # PE2_REPLAY (docs/BUILDING.md).
 # record_input = false
+# The pause menu's Debug panel, for testing: travel to any room and
+# entrance, refill HP and MP, cure status effects, add BP and EXP. Travel
+# keeps the story's flags as they are, so a room may play an event out of
+# order. PE2_DEBUG_MENU=1 turns it on too.
+# menu = false

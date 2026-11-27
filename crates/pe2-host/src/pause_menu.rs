@@ -82,6 +82,17 @@ pub extern "C" fn pc_menu_confirms_quit() -> i32 {
     i32::from(crate::config::get().general.confirm_exit.unwrap_or(true))
 }
 
+/// Whether the pause menu has its Debug panel ([debug] menu, or
+/// PE2_DEBUG_MENU=1; default off).
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_debug_menu() -> i32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    i32::from(*ON.get_or_init(|| match std::env::var("PE2_DEBUG_MENU") {
+        Ok(v) => v != "0",
+        Err(_) => crate::config::get().debug.menu.unwrap_or(false),
+    }))
+}
+
 /// Quit game.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_menu_quit() {

@@ -60,6 +60,9 @@ pub struct Debug {
     /// Record each session's input into recordings/ (runtime/replay.rs;
     /// default off).
     pub record_input: Option<bool>,
+    /// The pause menu's Debug panel: travel to any room, refill HP and MP,
+    /// add BP and EXP (default off; PE2_DEBUG_MENU=1 turns it on too).
+    pub menu: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
