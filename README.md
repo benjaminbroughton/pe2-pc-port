@@ -1,5 +1,19 @@
 # PE2PC: Parasite Eve II, native on PC
 
+> [!WARNING]
+> **This is an experimental fork of
+> [PE2PC](https://github.com/Snaity-CORE/pe2-pc-port), focused on developing
+> dynamic widescreen support.** Like the *Resident Evil* HD Remaster and
+> *Resident Evil 0* HD Remaster, it fills a widescreen window by showing a
+> band of each 4:3 pre-rendered background, and that band pans up and down to
+> keep Aya in view. The HUD, menus and text stay 4:3 over the picture, and
+> movies stay 4:3. It is a work in progress: expect visual glitches. Turn it
+> on in Options → Video (or the launcher) with **Widescreen**. For the stable
+> port, use [the original repository](https://github.com/Snaity-CORE/pe2-pc-port).
+>
+_______
+> ORIGINAL README
+
 <a href="https://recomplauncher.com/game/pe2-pc-port"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
 
 A native PC port of *Parasite Eve II* (PlayStation, USA release) built on the
